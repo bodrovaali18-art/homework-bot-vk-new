@@ -1,16 +1,20 @@
-
 import logging
 import os
 import sys
 import time
+from http import HTTPStatus
 
 import requests
 import vk_api
 from dotenv import load_dotenv
 
+from exceptions import (
+    APIConnectionError,
+    APIResponseError,
+    HomeworkStatusError,
+)
 
 load_dotenv()
-
 
 PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
 VK_TOKEN = os.getenv('VK_TOKEN')
@@ -20,12 +24,13 @@ RETRY_PERIOD = 600
 ENDPOINT = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
 HEADERS = {'Authorization': f'OAuth {PRACTICUM_TOKEN}'}
 
-
 HOMEWORK_VERDICTS = {
     'approved': 'Работа проверена: ревьюеру всё понравилось. Ура!',
     'reviewing': 'Работа взята на проверку ревьюером.',
     'rejected': 'Работа проверена: у ревьюера есть замечания.'
 }
+
+logger = logging.getLogger(__name__)
 
 
 def check_tokens():
@@ -36,14 +41,20 @@ def check_tokens():
         'VK_USER_ID': VK_USER_ID
     }
 
-    for token_name, token_value in tokens.items():
-        if not token_value:
-            logging.critical(
-                'Отсутствует обязательная переменная окружения: %s',
-                token_name
-            )
+    missing_tokens = [
+        token_name
+        for token_name, token_value in tokens.items()
+        if not token_value
+    ]
 
-    return all(tokens.values())
+    if missing_tokens:
+        logger.critical(
+            'Отсутствуют обязательные переменные окружения: %s',
+            ', '.join(missing_tokens)
+        )
+        return False
+
+    return True
 
 
 def send_message(vk, message):
@@ -53,7 +64,7 @@ def send_message(vk, message):
         message=message,
         random_id=0
     )
-    logging.debug('Бот отправил сообщение "%s"', message)
+    logger.debug('Бот отправил сообщение "%s"', message)
 
 
 def get_api_answer(timestamp):
@@ -67,20 +78,26 @@ def get_api_answer(timestamp):
             params=payload
         )
     except requests.RequestException as error:
-        logging.error('Ошибка при запросе к API: %s', error)
-        raise ConnectionError(
+        logger.error('Ошибка при запросе к API: %s', error)
+        raise APIConnectionError(
             f'Эндпоинт {ENDPOINT} недоступен.'
         ) from error
 
-    if response.status_code != 200:
+    if response.status_code != HTTPStatus.OK:
         error_message = (
             f'Эндпоинт {ENDPOINT} недоступен. '
             f'Код ответа API: {response.status_code}'
         )
-        logging.error(error_message)
-        raise RuntimeError(error_message)
+        logger.error(error_message)
+        raise APIResponseError(error_message)
 
-    return response.json()
+    try:
+        return response.json()
+    except requests.exceptions.JSONDecodeError as error:
+        logger.error('Не удалось декодировать JSON: %s', error)
+        raise APIResponseError(
+            'Ответ API не удалось преобразовать в JSON.'
+        ) from error
 
 
 def check_response(response):
@@ -99,16 +116,6 @@ def check_response(response):
 
     if not isinstance(response['current_date'], int):
         raise TypeError('Значение current_date должно быть числом.')
-
-    for homework in response['homeworks']:
-        if not isinstance(homework, dict):
-            raise TypeError('Элемент списка homeworks должен быть словарём.')
-
-        if 'homework_name' not in homework:
-            raise KeyError('В домашней работе отсутствует homework_name.')
-
-        if 'status' not in homework:
-            raise KeyError('В домашней работе отсутствует status.')
 
     return response['homeworks']
 
@@ -129,18 +136,18 @@ def parse_status(homework):
     status = homework['status']
 
     if status not in HOMEWORK_VERDICTS:
-        logging.error(
+        logger.error(
             'Обнаружен неожиданный статус домашней работы: %s',
             status
         )
-        raise ValueError(
+        raise HomeworkStatusError(
             f'Неизвестный статус домашней работы: {status}'
         )
 
     verdict = HOMEWORK_VERDICTS[status]
 
     return (
-        f'Изменился статус проверки работы '
+        'Изменился статус проверки работы '
         f'"{homework_name}". {verdict}'
     )
 
@@ -156,11 +163,10 @@ def main():
     if not check_tokens():
         raise SystemExit('Программа остановлена.')
 
-    # Создаем сессию для бота
     vk_session = vk_api.VkApi(token=VK_TOKEN)
     vk = vk_session.get_api()
-    timestamp = int(time.time())
 
+    timestamp = int(time.time())
     error_message = None
 
     while True:
@@ -174,21 +180,22 @@ def main():
                     message = parse_status(homework)
                     send_message(vk, message)
             else:
-                logging.debug('В ответе API нет новых статусов.')
+                logger.debug('В ответе API нет новых статусов.')
 
             error_message = None
 
         except Exception as error:
             message = f'Сбой в работе программы: {error}'
-            logging.error(message)
+            logger.error(message)
 
             if message != error_message:
                 try:
                     send_message(vk, message)
                     error_message = message
                 except Exception as send_error:
-                    logging.error(
-                        'Не удалось отправить сообщение об ошибке в VK: %s',
+                    logger.error(
+                        'Не удалось отправить сообщение об ошибке '
+                        'в VK: %s',
                         send_error
                     )
 
